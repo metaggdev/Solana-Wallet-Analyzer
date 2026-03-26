@@ -1,0 +1,708 @@
+"""
+Solana Wallet Token Analyzer
+Analyzes wallet addresses and categorizes them based on token deployment activity
+Uses Helius API for token creation data + Bitquery API for all-time volume data
+OPTIMIZED: Uses sequential requests with rate limiting for Bitquery
+"""
+
+import requests
+import csv
+import time
+import json
+import os
+from datetime import datetime
+from typing import Dict, List, Set, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# CONFIGURATION
+
+# Helius API Configuration
+HELIUS_API_KEY = "db683a77-edb6-4c80-8cac-944640c07e21"
+HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+# Birdeye API (fallback for 24h data)
+BIRDEYE_API_KEY = "583e4cb8f8854e1b9dd0b281c0beea7e"
+BIRDEYE_BASE = "https://public-api.birdeye.so"
+
+# Bitquery API for ALL-TIME volume data (primary source)
+BITQUERY_API_KEY = "ory_at_f69h1vIyqfoZCMQBZHilDNqYO6jAXQuZXqmkMGfJqhU.YR3ogtPpi1ouRZkMkLCx8pLRHFr5QkIq0Q8yhGxDSZs"
+BITQUERY_URL = "https://streaming.bitquery.io/graphql"
+
+# DexScreener as fallback
+DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
+
+# Rate limiting - CONSERVATIVE for Bitquery (10 req/min limit)
+RATE_LIMIT_DELAY = 0.5  # seconds between wallets
+MAX_RETRIES = 3  # retry on rate limits
+REQUEST_TIMEOUT = 30  # longer timeout for GraphQL
+MAX_WORKERS = 3  # reduced to stay under rate limits
+BITQUERY_DELAY = 7  # seconds between Bitquery requests (10 req/min = 6s min)
+
+# File paths
+INPUT_FILE = "wallets.txt"
+PROCESSED_LOG = "processed_wallets.log"
+FAILED_LOG = "failed_wallets.log"
+HIGH_VOLUME_CSV = "wallets_with_highest_recent_volume.csv"
+LOW_VOLUME_CSV = "wallets_without_highest_recent_volume.csv"
+SUMMARY_FILE = "summary_report.txt"
+VOLUME_DEBUG_LOG = "volume_debug.log"  # NEW: Diagnostic log for volume issues
+
+# CSV Headers
+CSV_HEADERS = [
+    'wallet_address',
+    'total_tokens_created',
+    'most_recent_token',
+    'most_recent_token_symbol',
+    'recent_token_volume_alltime',
+    'highest_volume_token',
+    'highest_volume_amount',
+    'all_tokens_data'
+]
+
+# CHECKPOINT & LOGGING FUNCTIONS
+
+def load_processed_wallets() -> Set[str]:
+    """Load set of already processed wallet addresses from log file"""
+    try:
+        with open(PROCESSED_LOG, 'r') as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
+def log_processed_wallet(wallet_address: str):
+    """Append successfully processed wallet to log"""
+    with open(PROCESSED_LOG, 'a') as f:
+        f.write(f"{wallet_address}\n")
+
+def log_failed_wallet(wallet_address: str, error_msg: str):
+    """Log failed wallet with error message and timestamp"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(FAILED_LOG, 'a') as f:
+        f.write(f"{wallet_address}|{error_msg}|{timestamp}\n")
+
+# HELIUS API - GET TOKENS CREATED BY WALLET
+
+def get_tokens_created_by_wallet(wallet_address: str, attempt: int = 1) -> Optional[List[Dict]]:
+    """
+    Use Helius DAS API to get fungible tokens created by a wallet address
+    """
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "wallet-analyzer",
+            "method": "getAssetsByCreator",
+            "params": {
+                "creatorAddress": wallet_address,
+                "onlyVerified": False,
+                "page": 1,
+                "limit": 1000
+            }
+        }
+        
+        response = requests.post(
+            HELIUS_RPC_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT
+        )
+        
+        if response.status_code == 429:
+            if attempt < MAX_RETRIES:
+                time.sleep(2 ** attempt)
+                return get_tokens_created_by_wallet(wallet_address, attempt + 1)
+            return None
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'result' in data and 'items' in data['result']:
+                tokens = []
+                for item in data['result']['items']:
+                    interface = item.get('interface', '')
+                    if interface in ['FungibleToken', 'FungibleAsset'] or item.get('token_info'):
+                        tokens.append({
+                            'address': item.get('id', ''),
+                            'symbol': item.get('content', {}).get('metadata', {}).get('symbol', 'UNKNOWN'),
+                            'name': item.get('content', {}).get('metadata', {}).get('name', 'Unknown'),
+                            'created_at': item.get('created_at', 0)
+                        })
+                return tokens
+            return []
+        
+        if attempt < MAX_RETRIES:
+            time.sleep(1)
+            return get_tokens_created_by_wallet(wallet_address, attempt + 1)
+        
+        return None
+        
+    except Exception as e:
+        if attempt < MAX_RETRIES:
+            time.sleep(1)
+            return get_tokens_created_by_wallet(wallet_address, attempt + 1)
+        return None
+
+# BITQUERY API - GET ALL-TIME VOLUME DATA (PRIMARY SOURCE)
+
+# Track last Bitquery request time for rate limiting
+_last_bitquery_request = 0
+
+def get_token_volume_bitquery(token_address: str) -> tuple:
+    """
+    Get ALL-TIME trading volume for a token from Bitquery GraphQL API
+    Returns: (token_address, volume_usd, status) tuple
+    Status: 'success', 'rate_limited', 'not_found', 'error'
+    """
+    global _last_bitquery_request
+    
+    try:
+        # Respect rate limiting (10 req/min for free tier)
+        elapsed = time.time() - _last_bitquery_request
+        if elapsed < BITQUERY_DELAY:
+            time.sleep(BITQUERY_DELAY - elapsed)
+        
+        # GraphQL query for aggregated volume across all pools
+        query = """
+        {
+            Solana(dataset: archive) {
+                DEXTradeByTokens(
+                    where: {Trade: {Currency: {MintAddress: {is: "%s"}}}}
+                ) {
+                    Trade {
+                        Currency {
+                            Symbol
+                        }
+                    }
+                    volume: sum(of: Trade_Side_AmountInUSD)
+                }
+            }
+        }
+        """ % token_address
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {BITQUERY_API_KEY}"
+        }
+        
+        _last_bitquery_request = time.time()
+        response = requests.post(
+            BITQUERY_URL,
+            json={"query": query},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT
+        )
+        
+        if response.status_code == 429:
+            log_volume_debug(f"BITQUERY_RATE_LIMITED: {token_address[:8]}...")
+            return (token_address, 0.0, 'rate_limited')
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Check for errors
+            if data.get('errors'):
+                log_volume_debug(f"BITQUERY_ERROR: {token_address[:8]}... - {data['errors'][0].get('message', 'Unknown error')}")
+                return (token_address, 0.0, 'error')
+            
+            # Sum volumes from all pools/markets
+            trades = data.get('data', {}).get('Solana', {}).get('DEXTradeByTokens', [])
+            
+            if not trades:
+                log_volume_debug(f"BITQUERY_NO_DATA: {token_address[:8]}... - No trades found")
+                return (token_address, 0.0, 'not_found')
+            
+            # Aggregate volume across all pools
+            total_volume = 0.0
+            symbol = "UNKNOWN"
+            for trade in trades:
+                try:
+                    vol = float(trade.get('volume', 0) or 0)
+                    total_volume += vol
+                    if trade.get('Trade', {}).get('Currency', {}).get('Symbol'):
+                        symbol = trade['Trade']['Currency']['Symbol']
+                except (ValueError, TypeError):
+                    continue
+            
+            if total_volume > 0:
+                log_volume_debug(f"BITQUERY_SUCCESS: {symbol} ({token_address[:8]}...) -> ${total_volume:,.2f}")
+                return (token_address, total_volume, 'success')
+            else:
+                log_volume_debug(f"BITQUERY_ZERO: {symbol} ({token_address[:8]}...) - Total volume was 0")
+                return (token_address, 0.0, 'not_found')
+        else:
+            log_volume_debug(f"BITQUERY_HTTP_ERROR: {token_address[:8]}... - Status {response.status_code}")
+            return (token_address, 0.0, 'error')
+            
+    except requests.exceptions.Timeout:
+        log_volume_debug(f"BITQUERY_TIMEOUT: {token_address[:8]}...")
+        return (token_address, 0.0, 'error')
+    except Exception as e:
+        log_volume_debug(f"BITQUERY_EXCEPTION: {token_address[:8]}... - {str(e)}")
+        return (token_address, 0.0, 'error')
+
+# BIRDEYE API - GET 24H VOLUME DATA (FALLBACK - with diagnostic logging)
+
+def log_volume_debug(message: str):
+    """Write diagnostic message to volume debug log"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(VOLUME_DEBUG_LOG, 'a') as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+
+def get_token_volume_birdeye(token_address: str) -> tuple:
+    """
+    Get 24-hour trading volume for a token from Birdeye API
+    Returns: (token_address, volume_usd, status) tuple
+    Status: 'success', 'rate_limited', 'not_found', 'error'
+    """
+    try:
+        # Primary endpoint: token overview
+        url = f"{BIRDEYE_BASE}/defi/token_overview"
+        headers = {
+            "X-API-KEY": BIRDEYE_API_KEY,
+            "x-chain": "solana"
+        }
+        params = {"address": token_address}
+        
+        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        
+        # Handle rate limiting
+        if response.status_code == 429:
+            log_volume_debug(f"RATE_LIMITED: {token_address[:8]}... - token_overview endpoint")
+            return (token_address, 0.0, 'rate_limited')
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success') and data.get('data'):
+                token_data = data['data']
+                symbol = token_data.get('symbol', 'UNKNOWN')
+                
+                # Get 24h volume (v24hUSD is the correct field)
+                volume = token_data.get('v24hUSD', 0) or 0
+                
+                # Log what we found
+                if volume and volume > 0:
+                    log_volume_debug(f"SUCCESS: {symbol} ({token_address[:8]}...) -> ${volume:,.2f}")
+                    return (token_address, float(volume), 'success')
+                else:
+                    log_volume_debug(f"ZERO_VOLUME: {symbol} ({token_address[:8]}...) - v24hUSD was {token_data.get('v24hUSD')}")
+            else:
+                log_volume_debug(f"NO_DATA: {token_address[:8]}... - API success=False or no data field")
+        elif response.status_code != 429:
+            log_volume_debug(f"HTTP_ERROR: {token_address[:8]}... - Status {response.status_code}")
+        
+        # Fallback: try trade data endpoint
+        url2 = f"{BIRDEYE_BASE}/defi/v3/token/trade-data/single"
+        params2 = {"address": token_address}
+        response2 = requests.get(url2, headers=headers, params=params2, timeout=REQUEST_TIMEOUT)
+        
+        if response2.status_code == 429:
+            log_volume_debug(f"RATE_LIMITED: {token_address[:8]}... - trade-data endpoint")
+            return (token_address, 0.0, 'rate_limited')
+        
+        if response2.status_code == 200:
+            data2 = response2.json()
+            if data2.get('success') and data2.get('data'):
+                trade_data = data2['data']
+                # Correct field names for this endpoint
+                volume_24h = trade_data.get('volume_24h_usd', 0) or 0
+                
+                if volume_24h and volume_24h > 0:
+                    log_volume_debug(f"SUCCESS_FALLBACK: {token_address[:8]}... -> ${volume_24h:,.2f} (via trade-data)")
+                    return (token_address, float(volume_24h), 'success')
+                else:
+                    log_volume_debug(f"ZERO_VOLUME_FALLBACK: {token_address[:8]}... - volume_24h_usd was {trade_data.get('volume_24h_usd')}")
+        
+        log_volume_debug(f"NOT_FOUND: {token_address[:8]}... - Both endpoints returned no volume")
+        return (token_address, 0.0, 'not_found')
+        
+    except requests.exceptions.Timeout:
+        log_volume_debug(f"TIMEOUT: {token_address[:8]}...")
+        return (token_address, 0.0, 'error')
+    except Exception as e:
+        log_volume_debug(f"EXCEPTION: {token_address[:8]}... - {str(e)}")
+        return (token_address, 0.0, 'error')
+
+# Keep old function name for compatibility
+def get_token_alltime_volume_birdeye(token_address: str) -> tuple:
+    """Wrapper for backwards compatibility - now returns 24h volume"""
+    addr, vol, status = get_token_volume_birdeye(token_address)
+    return (addr, vol)
+
+
+def get_token_volume_dexscreener(token_address: str) -> tuple:
+    """
+    Fallback: Get volume from DexScreener (24h only)
+    Returns: (token_address, volume) tuple
+    """
+    try:
+        url = f"{DEXSCREENER_BASE}/tokens/{token_address}"
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code == 200:
+            data = response.json()
+            pairs = data.get('pairs', [])
+            total_volume = sum(float(p.get('volume', {}).get('h24', 0) or 0) for p in pairs)
+            return (token_address, total_volume)
+        
+        return (token_address, 0.0)
+        
+    except:
+        return (token_address, 0.0)
+
+def fetch_volumes_concurrent(tokens: List[Dict]) -> Dict[str, float]:
+    """
+    Fetch ALL-TIME volumes for multiple tokens
+    Uses Bitquery API primarily (for all-time volume), with Birdeye as fallback
+    Note: Sequential for Bitquery due to rate limits (10 req/min)
+    Returns: dict mapping token_address -> volume
+    """
+    volumes = {}
+    
+    print(f"    Fetching volumes for {len(tokens)} tokens via Bitquery...")
+    
+    # Primary: Use Bitquery for all-time volume (sequential due to rate limits)
+    for i, token in enumerate(tokens):
+        if not token.get('address'):
+            continue
+            
+        token_addr = token['address']
+        addr, volume, status = get_token_volume_bitquery(token_addr)
+        
+        if status == 'success' and volume > 0:
+            volumes[token_addr] = volume
+        
+        # Progress indicator
+        if (i + 1) % 3 == 0:
+            print(f"    Progress: {i + 1}/{len(tokens)} tokens processed")
+    
+    # Fallback: For tokens with 0 volume from Bitquery, try Birdeye (24h)
+    zero_volume_tokens = [t for t in tokens if volumes.get(t['address'], 0) == 0 and t.get('address')]
+    
+    if zero_volume_tokens:
+        print(f"    Trying Birdeye fallback for {len(zero_volume_tokens)} tokens...")
+        
+        for token in zero_volume_tokens:
+            token_addr = token['address']
+            addr, volume, status = get_token_volume_birdeye(token_addr)
+            
+            if status == 'success' and volume > 0:
+                volumes[token_addr] = volume
+                log_volume_debug(f"FALLBACK_BIRDEYE: {token_addr[:8]}... -> ${volume:,.2f}")
+            
+            # Small delay to avoid Birdeye rate limits too
+            time.sleep(0.5)
+    
+    return volumes
+
+# ALTERNATIVE: SEARCH DEXSCREENER DIRECTLY
+
+def search_tokens_by_wallet(wallet_address: str) -> List[Dict]:
+    """Alternative: Search DexScreener for tokens associated with wallet"""
+    try:
+        url = f"{DEXSCREENER_BASE}/search?q={wallet_address}"
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code == 200:
+            data = response.json()
+            pairs = data.get('pairs', [])
+            
+            tokens = {}
+            for pair in pairs:
+                token_addr = pair.get('baseToken', {}).get('address', '')
+                if token_addr and token_addr not in tokens:
+                    tokens[token_addr] = {
+                        'address': token_addr,
+                        'symbol': pair.get('baseToken', {}).get('symbol', 'UNKNOWN'),
+                        'name': pair.get('baseToken', {}).get('name', 'Unknown'),
+                        'created_at': pair.get('pairCreatedAt', 0),
+                        'volume_alltime': 0.0
+                    }
+            
+            return list(tokens.values())
+    except:
+        pass
+    
+    return []
+
+# TOKEN ANALYSIS LOGIC - WITH ALL-TIME VOLUME
+
+def analyze_wallet(wallet_address: str) -> Optional[Dict]:
+    """
+    Analyze tokens for a wallet:
+    1. Get tokens created by wallet (Helius)
+    2. Get 24h volume for each token (Birdeye)
+    3. Determine if most recent token has highest volume
+    
+    Logic: If most_recent_token_volume > all_other_tokens_volumes (individually),
+           then "with highest", otherwise "without highest"
+    """
+    print(f"  Fetching tokens...")
+    
+    # Try Helius first
+    tokens = get_tokens_created_by_wallet(wallet_address)
+    
+    # Fallback to DexScreener
+    if not tokens:
+        tokens = search_tokens_by_wallet(wallet_address)
+    
+    if not tokens:
+        log_failed_wallet(wallet_address, "No tokens found")
+        return None
+    
+    print(f"  Found {len(tokens)} tokens")
+    
+    # Sort by creation time to find most recent (highest created_at = most recent)
+    tokens.sort(key=lambda x: (x.get('created_at', 0), x.get('address', '')), reverse=True)
+    
+    # Only analyze top 10 most recent tokens for speed
+    tokens_to_check = tokens[:10]
+    
+    # Fetch all-time volumes using Bitquery (with Birdeye fallback)
+    print(f"  Fetching all-time volumes via Bitquery...")
+    volumes = fetch_volumes_concurrent(tokens_to_check)
+    
+    # Apply volumes to tokens
+    for token in tokens_to_check:
+        token['volume_alltime'] = volumes.get(token['address'], 0.0)
+    
+    tokens_with_data = [t for t in tokens_to_check if t.get('address')]
+    
+    if not tokens_with_data:
+        log_failed_wallet(wallet_address, "No valid tokens")
+        return None
+    
+    # Most recent token is the first one (sorted by created_at descending)
+    most_recent_token = tokens_with_data[0]
+    
+    # Find token with highest volume
+    highest_volume_token = max(tokens_with_data, key=lambda x: x.get('volume_alltime', 0))
+    
+    # Check if most recent token has the highest volume
+    # If most_recent volume >= highest volume of any other token, it's "with highest"
+    has_highest_volume = (most_recent_token['address'] == highest_volume_token['address'])
+    
+    # Create summary of all tokens (sorted by volume)
+    all_tokens_summary = "; ".join([
+        f"{t.get('symbol', 'UNK')}(${t.get('volume_alltime', 0):,.0f})"
+        for t in sorted(tokens_with_data, key=lambda x: x.get('volume_alltime', 0), reverse=True)[:5]
+    ])
+    
+    return {
+        'wallet_address': wallet_address,
+        'total_tokens_created': len(tokens),  # Total tokens, not just analyzed
+        'most_recent_token': most_recent_token.get('address', ''),
+        'most_recent_token_symbol': most_recent_token.get('symbol', 'UNKNOWN'),
+        'recent_token_volume_alltime': most_recent_token.get('volume_alltime', 0),
+        'highest_volume_token': highest_volume_token.get('address', ''),
+        'highest_volume_amount': highest_volume_token.get('volume_alltime', 0),
+        'all_tokens_data': all_tokens_summary,
+        'has_highest_volume': has_highest_volume
+    }
+
+# CSV OUTPUT FUNCTIONS
+
+def initialize_csv_files():
+    """Create CSV files with headers if they don't exist"""
+    for filename in [HIGH_VOLUME_CSV, LOW_VOLUME_CSV]:
+        if not os.path.exists(filename):
+            with open(filename, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+                writer.writeheader()
+
+def write_to_csv(wallet_data: Dict):
+    """Write wallet data to appropriate CSV file"""
+    filename = (HIGH_VOLUME_CSV if wallet_data['has_highest_volume'] 
+                else LOW_VOLUME_CSV)
+    
+    csv_data = {k: v for k, v in wallet_data.items() if k != 'has_highest_volume'}
+    
+    with open(filename, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer.writerow(csv_data)
+
+def add_summary_row():
+    """Add summary row to CSV files"""
+    for filename in [HIGH_VOLUME_CSV, LOW_VOLUME_CSV]:
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            
+            if rows:
+                total_wallets = len(rows)
+                total_tokens = sum(int(row.get('total_tokens_created', 0)) for row in rows)
+                avg_tokens = total_tokens / total_wallets if total_wallets > 0 else 0
+                
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+                    writer.writeheader()
+                    
+                    summary_row = {
+                        'wallet_address': f'SUMMARY: {total_wallets} wallets',
+                        'total_tokens_created': f'{total_tokens} total tokens',
+                        'most_recent_token': f'Avg: {avg_tokens:.1f} tokens/wallet',
+                        'most_recent_token_symbol': '',
+                        'recent_token_volume_alltime': '',
+                        'highest_volume_token': '',
+                        'highest_volume_amount': '',
+                        'all_tokens_data': ''
+                    }
+                    writer.writerow(summary_row)
+                    
+                    separator_row = {field: '---' for field in CSV_HEADERS}
+                    writer.writerow(separator_row)
+                    
+                    writer.writerows(rows)
+
+# SUMMARY REPORT
+
+def generate_summary(total_wallets: int, successful: int, failed: int, skipped: int):
+    """Generate final summary report"""
+    high_volume_count = 0
+    low_volume_count = 0
+    
+    if os.path.exists(HIGH_VOLUME_CSV):
+        with open(HIGH_VOLUME_CSV, 'r') as f:
+            high_volume_count = max(0, sum(1 for line in f) - 3)
+    
+    if os.path.exists(LOW_VOLUME_CSV):
+        with open(LOW_VOLUME_CSV, 'r') as f:
+            low_volume_count = max(0, sum(1 for line in f) - 3)
+    
+    report = f"""
+{'='*60}
+WALLET ANALYSIS SUMMARY REPORT
+{'='*60}
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+INPUT STATISTICS:
+- Total wallet addresses in input file: {total_wallets}
+- Already processed (skipped): {skipped}
+- Wallets processed in this run: {total_wallets - skipped}
+
+PROCESSING RESULTS:
+- Successfully analyzed: {successful}
+- Failed to process: {failed}
+- Success rate: {(successful/(successful+failed)*100) if (successful+failed) > 0 else 0:.2f}%
+
+CATEGORIZATION:
+- Wallets with highest recent volume: {high_volume_count}
+- Wallets without highest recent volume: {low_volume_count}
+
+VALIDATION CHECK:
+- Processed + Failed = {successful + failed}
+- Should equal total processed = {total_wallets - skipped}
+- Status: {'PASS' if (successful + failed) == (total_wallets - skipped) else 'FAIL'}
+
+OUTPUT FILES:
+- High volume wallets: {HIGH_VOLUME_CSV}
+- Low volume wallets: {LOW_VOLUME_CSV}
+- Processed log: {PROCESSED_LOG}
+- Failed log: {FAILED_LOG}
+
+{'='*60}
+"""
+    
+    with open(SUMMARY_FILE, 'w') as f:
+        f.write(report)
+    
+    print(report)
+
+# MAIN PROCESSING LOOP
+
+def main():
+    """Main execution function"""
+    print("\n" + "="*60)
+    print("SOLANA WALLET TOKEN ANALYZER")
+    print("Using: Helius + Bitquery (All-Time Volume)")
+    print("="*60 + "\n")
+    
+    # Initialize debug log for this run
+    with open(VOLUME_DEBUG_LOG, 'w') as f:
+        f.write(f"=== Volume Fetch Debug Log (Bitquery) ===\n")
+        f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"{'='*40}\n\n")
+    print(f"Debug logging enabled: {VOLUME_DEBUG_LOG}")
+    print(f"Note: Using 7-second delay between tokens for rate limiting")
+    
+    if not os.path.exists(INPUT_FILE):
+        print(f"ERROR: Input file '{INPUT_FILE}' not found!")
+        return
+    
+    print(f"Loading wallet addresses from {INPUT_FILE}...")
+    with open(INPUT_FILE, 'r') as f:
+        all_wallets = [line.strip() for line in f if line.strip() and not line.startswith('<')]
+    
+    if not all_wallets:
+        print("ERROR: No wallet addresses found!")
+        return
+    
+    processed_wallets = load_processed_wallets()
+    remaining_wallets = [w for w in all_wallets if w not in processed_wallets]
+    
+    print(f"\nSTATUS:")
+    print(f"  Total wallets: {len(all_wallets)}")
+    print(f"  Already done: {len(processed_wallets)}")
+    print(f"  Remaining: {len(remaining_wallets)}")
+    
+    if not remaining_wallets:
+        print("\n[OK] All wallets already processed!")
+        return
+    
+    initialize_csv_files()
+    
+    print(f"\nStarting parallel processing...\n")
+    
+    successful_count = 0
+    failed_count = 0
+    start_time = time.time()
+    
+    for idx, wallet in enumerate(remaining_wallets, 1):
+        elapsed = time.time() - start_time
+        rate = idx / elapsed if elapsed > 0 else 0
+        remaining = (len(remaining_wallets) - idx) / rate if rate > 0 else 0
+        
+        print(f"[{idx}/{len(remaining_wallets)}] {wallet[:8]}...{wallet[-6:]}")
+        print(f"  Speed: {rate:.1f} wallets/sec | ETA: {int(remaining)}s")
+        
+        result = analyze_wallet(wallet)
+        
+        if result:
+            write_to_csv(result)
+            log_processed_wallet(wallet)
+            successful_count += 1
+            
+            status = "[HIGH]" if result['has_highest_volume'] else "[Low]"
+            print(f"  {status} | Tokens: {result['total_tokens_created']} | Recent Vol: ${result['recent_token_volume_alltime']:,.0f} | Highest: ${result['highest_volume_amount']:,.0f}")
+        else:
+            failed_count += 1
+            print(f"  [FAIL] Failed")
+        
+        time.sleep(RATE_LIMIT_DELAY)
+        print()
+    
+    total_time = time.time() - start_time
+    
+    print("Finalizing...")
+    add_summary_row()
+    
+    generate_summary(
+        total_wallets=len(all_wallets),
+        successful=successful_count,
+        failed=failed_count,
+        skipped=len(processed_wallets)
+    )
+    
+    print(f"\nDONE in {total_time:.1f}s!")
+    print(f"  Speed: {len(remaining_wallets)/total_time:.2f} wallets/second")
+    print(f"  Successful: {successful_count}")
+    print(f"  Failed: {failed_count}\n")
+
+# ENTRY POINT
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] Interrupted - Progress saved. Run again to resume.")
+    except Exception as e:
+        print(f"\n\n[X] Error: {str(e)}")
