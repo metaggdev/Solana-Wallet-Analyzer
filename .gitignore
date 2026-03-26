@@ -1,8 +1,47 @@
-*.csv
-*.log
-summary_report.txt
+# Environment / secrets
+.env
+.env.local
+
+# Input data / sensitive lists
+wallets.txt
+
+# Python environments
 venv/
+.venv/
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+
+# Build / packaging artifacts
 dist/
 build/
 *.spec
-__pycache__/
+*.egg-info/
+
+# Test / quality / tooling artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.iml
+.cursor/
+
+# OS junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# App outputs (avoid committing large/volatile results)
+*.log
+*.csv
+summary_report.txt
+processed_wallets.log
+failed_wallets.log
+volume_debug.log

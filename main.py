@@ -10,42 +10,123 @@ import csv
 import time
 import json
 import os
+import re
 from datetime import datetime
 from typing import Dict, List, Set, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Load environment variables from a local `.env` file (if present).
+# This avoids hardcoding API keys in source code.
+def _load_env_file(env_path: str) -> None:
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                # Support KEY=VALUE (only split on the first '=')
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                # Support inline comments like: KEY="0.5"  # comment
+                # Strip everything after the first `#` unless the value is quoted;
+                # for quoted values, keep content through the closing quote.
+                if "#" in value:
+                    if value and value[0] in ('"', "'"):
+                        quote = value[0]
+                        end_quote_idx = value.find(quote, 1)
+                        if end_quote_idx != -1:
+                            value = value[: end_quote_idx + 1].strip()
+                        else:
+                            value = value.split("#", 1)[0].strip()
+                    else:
+                        value = value.split("#", 1)[0].strip()
+
+                # Strip surrounding quotes: KEY="value" or KEY='value'
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+
+                # Don't overwrite variables already set in the shell.
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+
+
+# Read .env from the same directory as this script.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_load_env_file(os.path.join(_BASE_DIR, ".env"))
+
 # CONFIGURATION
 
 # Helius API Configuration
-HELIUS_API_KEY = "db683a77-edb6-4c80-8cac-944640c07e21"
-HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 
 # Birdeye API (fallback for 24h data)
-BIRDEYE_API_KEY = "583e4cb8f8854e1b9dd0b281c0beea7e"
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 
 # Bitquery API for ALL-TIME volume data (primary source)
-BITQUERY_API_KEY = "ory_at_f69h1vIyqfoZCMQBZHilDNqYO6jAXQuZXqmkMGfJqhU.YR3ogtPpi1ouRZkMkLCx8pLRHFr5QkIq0Q8yhGxDSZs"
+BITQUERY_API_KEY = os.getenv("BITQUERY_API_KEY")
 BITQUERY_URL = "https://streaming.bitquery.io/graphql"
 
 # DexScreener as fallback
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
 
+_missing_env = [
+    name
+    for name, value in [
+        ("HELIUS_API_KEY", HELIUS_API_KEY),
+        ("BIRDEYE_API_KEY", BIRDEYE_API_KEY),
+        ("BITQUERY_API_KEY", BITQUERY_API_KEY),
+    ]
+    if not value
+]
+if _missing_env:
+    raise SystemExit(
+        "Missing required environment variables: "
+        + ", ".join(_missing_env)
+        + ". Create a `.env` file (see `.env.sample`) and set these keys."
+    )
+
+# Helpers to read and type-cast env vars with defaults.
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+# Helius RPC URL depends on the Helius API key.
+HELIUS_RPC_URL = os.getenv(
+    "HELIUS_RPC_URL",
+    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+)
+
 # Rate limiting - CONSERVATIVE for Bitquery (10 req/min limit)
-RATE_LIMIT_DELAY = 0.5  # seconds between wallets
-MAX_RETRIES = 3  # retry on rate limits
-REQUEST_TIMEOUT = 30  # longer timeout for GraphQL
-MAX_WORKERS = 3  # reduced to stay under rate limits
-BITQUERY_DELAY = 7  # seconds between Bitquery requests (10 req/min = 6s min)
+RATE_LIMIT_DELAY = _env_float("RATE_LIMIT_DELAY", 0.5)  # seconds between wallets
+MAX_RETRIES = _env_int("MAX_RETRIES", 3)  # retry on rate limits
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 30)  # longer timeout for GraphQL
+MAX_WORKERS = _env_int("MAX_WORKERS", 3)  # reduced to stay under rate limits
+BITQUERY_DELAY = _env_int("BITQUERY_DELAY", 7)  # seconds between Bitquery requests (10 req/min = 6s min)
 
 # File paths
-INPUT_FILE = "wallets.txt"
-PROCESSED_LOG = "processed_wallets.log"
-FAILED_LOG = "failed_wallets.log"
-HIGH_VOLUME_CSV = "wallets_with_highest_recent_volume.csv"
-LOW_VOLUME_CSV = "wallets_without_highest_recent_volume.csv"
-SUMMARY_FILE = "summary_report.txt"
-VOLUME_DEBUG_LOG = "volume_debug.log"  # NEW: Diagnostic log for volume issues
+INPUT_FILE = os.getenv("INPUT_FILE", "wallets.txt")
+PROCESSED_LOG = os.getenv("PROCESSED_LOG", "processed_wallets.log")
+FAILED_LOG = os.getenv("FAILED_LOG", "failed_wallets.log")
+HIGH_VOLUME_CSV = os.getenv("HIGH_VOLUME_CSV", "wallets_with_highest_recent_volume.csv")
+LOW_VOLUME_CSV = os.getenv("LOW_VOLUME_CSV", "wallets_without_highest_recent_volume.csv")
+SUMMARY_FILE = os.getenv("SUMMARY_FILE", "summary_report.txt")
+VOLUME_DEBUG_LOG = os.getenv("VOLUME_DEBUG_LOG", "volume_debug.log")  # NEW: Diagnostic log for volume issues
 
 # CSV Headers
 CSV_HEADERS = [
@@ -508,6 +589,19 @@ def initialize_csv_files():
                 writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
                 writer.writeheader()
 
+def _parse_int_from_mixed(value) -> int:
+    """Parse integers from strings like '4 total tokens'."""
+    if value is None:
+        return 0
+    try:
+        if isinstance(value, int):
+            return value
+        s = str(value).strip()
+        m = re.search(r"(-?\d+)", s)
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
 def write_to_csv(wallet_data: Dict):
     """Write wallet data to appropriate CSV file"""
     filename = (HIGH_VOLUME_CSV if wallet_data['has_highest_volume'] 
@@ -528,8 +622,20 @@ def add_summary_row():
                 rows = list(reader)
             
             if rows:
-                total_wallets = len(rows)
-                total_tokens = sum(int(row.get('total_tokens_created', 0)) for row in rows)
+                # If the script was run before, the CSV may already contain a
+                # previous SUMMARY/separator block. Ignore those when recalculating.
+                data_rows = [
+                    row for row in rows
+                    if (row.get('wallet_address') or '').strip()
+                    and (row.get('wallet_address') or '').strip() != '---'
+                    and not (row.get('wallet_address') or '').startswith('SUMMARY:')
+                ]
+
+                total_wallets = len(data_rows)
+                total_tokens = sum(
+                    _parse_int_from_mixed(row.get('total_tokens_created', 0))
+                    for row in data_rows
+                )
                 avg_tokens = total_tokens / total_wallets if total_wallets > 0 else 0
                 
                 with open(filename, 'w', newline='') as f:
@@ -551,7 +657,7 @@ def add_summary_row():
                     separator_row = {field: '---' for field in CSV_HEADERS}
                     writer.writerow(separator_row)
                     
-                    writer.writerows(rows)
+                    writer.writerows(data_rows)
 
 # SUMMARY REPORT
 
